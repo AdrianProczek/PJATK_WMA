@@ -1,78 +1,118 @@
 import cv2 as cv
 import numpy as np
+import os
 
 
-def detect_coins_and_tray(image_path):
-    img_color = cv.imread(image_path)
-    img_gray = cv.cvtColor(img_color, cv.COLOR_BGR2GRAY)
-    img_blur = cv.GaussianBlur(img_gray, (9, 9), 2)
+def detect_tray(image):
+    img_gray_scale = cv.cvtColor(image, cv.COLOR_BGR2GRAY)
+    img_gray_scale = cv.GaussianBlur(img_gray_scale, (7, 7), 0)
 
-    # Wykrywanie monet
-    circles = cv.HoughCircles(img_blur, cv.HOUGH_GRADIENT, dp=1.2, minDist=50,
-                              param1=100, param2=30, minRadius=10, maxRadius=100)
+    edges = cv.Canny(img_gray_scale, 30, 100)
 
-    coins = []
-    if circles is not None:
-        circles = np.uint16(np.around(circles[0]))
-        for circle in circles:
-            coins.append({'center': (circle[0], circle[1]), 'radius': circle[2]})
+    lines = cv.HoughLinesP(edges, 1, np.pi / 180, 90, minLineLength=100, maxLineGap=1000)
 
-    # Wykrywanie tacy (linii prostych)
-    edges = cv.Canny(img_gray, 50, 150, apertureSize=3)
-    lines = cv.HoughLinesP(edges, 1, np.pi / 180, threshold=100, minLineLength=150, maxLineGap=10)
+    mask = np.zeros_like(img_gray_scale)
 
-    tray_box = None
-    if lines is not None:
-        points = []
-        for line in lines:
-            x1, y1, x2, y2 = line[0]
-            points.extend([(x1, y1), (x2, y2)])
-        points = np.array(points)
-        tray_box = cv.boundingRect(points)
+    for line in lines:
+        x1, y1, x2, y2 = line[0]
+        cv.line(mask, (x1, y1), (x2, y2), 255, 2)
 
-    # Klasyfikacja monet
-    coins_on_tray = []
-    coins_off_tray = []
-    five_zl = []
-    five_gr = []
+    cv.imshow("Tray approx outline", mask)
 
-    if tray_box:
-        x, y, w, h = tray_box
-        for coin in coins:
-            cx, cy = coin['center']
-            if x <= cx <= x + w and y <= cy <= y + h:
-                coins_on_tray.append(coin)
-            else:
-                coins_off_tray.append(coin)
-    else:
-        coins_off_tray = coins  # Brak tacy wykrytej
+    kernel = np.ones((15, 15), np.uint8)
+    mask = cv.dilate(mask, kernel, iterations=1)
+    mask_closed = cv.morphologyEx(mask, cv.MORPH_CLOSE, kernel)
 
-    for coin in coins:
-        if coin['radius'] >= 35:  # granica promienia dla 5 zł
-            coin['type'] = '5zl'
-            five_zl.append(coin)
+    cv.imshow("Tray outline closed", mask_closed)
+    contours, _ = cv.findContours(mask_closed, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
+
+    largest_contour = max(contours, key=cv.contourArea)
+    tray_mask = np.zeros_like(img_gray_scale)
+    cv.drawContours(tray_mask, [largest_contour], 0, 255, -1)
+    cv.imshow("Tray mask", tray_mask)
+
+    return tray_mask
+
+
+def detect_coins(image):
+    img_gray_scale = cv.cvtColor(image, cv.COLOR_BGR2GRAY)
+    img_gray_scale = cv.medianBlur(img_gray_scale, 3)
+
+    cv.imshow("Gray", img_gray_scale)
+
+    clahe = cv.createCLAHE(clipLimit=4.0, tileGridSize=(12, 12))
+    img_gray_scale = clahe.apply(img_gray_scale)
+    cv.imshow("Gray contrast lift", img_gray_scale)
+
+    circles = cv.HoughCircles(
+        img_gray_scale, cv.HOUGH_GRADIENT, 1, 50,
+        param1=270, param2=35,
+        minRadius=20, maxRadius=70
+    )
+
+    return circles
+
+
+def classify_coins(image, circles, tray_mask):
+    coins_on_tray = {"5zl": 0, "5gr": 0}
+    coins_off_tray = {"5zl": 0, "5gr": 0}
+
+    result_img = image.copy()
+
+    circles = np.uint16(np.around(circles))
+
+    for circle in circles[0, :]:
+        x, y, r = circle
+
+        on_tray = tray_mask[y, x]
+
+        coin_type = "5zl" if r > 30 else "5gr"
+
+        if on_tray:
+            coins_on_tray[coin_type] += 1
+            color = (0, 255, 0)
         else:
-            coin['type'] = '5gr'
-            five_gr.append(coin)
+            coins_off_tray[coin_type] += 1
+            color = (0, 0, 255)
 
-    return {
-        'image': image_path,
-        'total_coins': len(coins),
-        'on_tray': len(coins_on_tray),
-        'off_tray': len(coins_off_tray),
-        '5zl': len([c for c in coins if c['type'] == '5zl']),
-        '5gr': len([c for c in coins if c['type'] == '5gr']),
-    }
+        cv.circle(result_img, (x, y), r, color, 2)
+        cv.circle(result_img, (x, y), 2, color, 3)
+        cv.putText(result_img, coin_type, (x - 20, y), cv.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+    cv.putText(result_img, f"On tray: 5zl: {coins_on_tray['5zl']}, 5gr: {coins_on_tray['5gr']}", (10, 30),
+               cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+    cv.putText(result_img, f"Off tray: 5zl: {coins_off_tray['5zl']}, 5gr: {coins_off_tray['5gr']}", (10, 60),
+               cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+    return result_img, coins_on_tray, coins_off_tray
 
 
-# Analiza wszystkich zdjęć
-image_files = [f"tray{i}.jpg" for i in range(1, 9)]
-for img in image_files:
-    result = detect_coins_and_tray(img)
-    print(f"--- {result['image']} ---")
-    print(f"  Wszystkie monety: {result['total_coins']}")
-    print(f"  Monety na tacy:   {result['on_tray']}")
-    print(f"  Monety poza tacą: {result['off_tray']}")
-    print(f"  5 zł:             {result['5zl']}")
-    print(f"  5 gr:             {result['5gr']}")
-    print()
+def main():
+    image_files = [f"tray{i}.jpg" for i in range(1, 9)]
+    print(image_files)
+    for image_file in sorted(image_files):
+
+        image = cv.imread(image_file)
+
+        tray_mask = detect_tray(image)
+
+        circles = detect_coins(image)
+
+        result_img, coins_on_tray, coins_off_tray = classify_coins(image, circles, tray_mask)
+
+        cv.imshow("Result", result_img)
+
+        print(f"Image: {image_file}")
+        print(f"On tray: 5zl: {coins_on_tray['5zl']},\n5gr: {coins_on_tray['5gr']}")
+        print(f"Off tray: 5zl: {coins_off_tray['5zl']},\n5gr: {coins_off_tray['5gr']}")
+        print("-" * 50)
+
+        key = cv.waitKey(0)
+        if key == 27:
+            break
+
+    cv.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
